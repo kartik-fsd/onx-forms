@@ -1,375 +1,419 @@
-import { useEffect, useState } from "preact/hooks";
-import { useForm } from "../../context/FormContext";
+import { useState, useEffect, useMemo } from "preact/hooks";
+import { route } from "preact-router";
 import FormStepper from "./stepper/FormStepper";
-import TextInput from "./inputs/TextInput";
-import ToggleInput from "./inputs/ToggleInput";
-import RadioInput from "./inputs/RadioInput";
-import CheckboxInput from "./inputs/CheckboxInput";
-import SelectInput from "./inputs/SelectInput";
-import ImageCaptureInput from "./inputs/ImageCaptureInput";
-import MediaUploadInput from "./inputs/MediaUploadInput";
-import AddressInput from "./inputs/AddressInput";
-import GeolocationInput from "./inputs/GeoLocation";
+import FormStep from "./stepper/FormStepper";
+import FormNavigation from "./FormNavigation";
+import LoadingIndicator from "../layout/LoadingIndicator";
+import ErrorDisplay from "../layout/ErrorDisplay";
+import SuccessDisplay from "../common/SuccessDisplay";
+import formTemplateService from "../../services/formTemplateService";
+import formDataService from "../../services/formDataService";
+import syncService from "../../services/syncService";
+import validator from "../../utils/validation";
+import { useOfflineStatus } from "../../hooks/useOfflineStatus";
+import { useAutoSave } from "../../hooks/useAutoSave";
 
-const FormRenderer = ({ formDefinition, draftId = null }) => {
-  const {
-    initForm,
-    loadDraft,
-    currentStep,
-    setStep,
-    formData,
-    updateField,
-    saveDraft,
-    submitForm,
-    lastSaved,
-    error,
-    clearError,
-    isSubmitting,
-    isSaving,
-    isLoading,
-  } = useForm();
-
-  const [formSubmitted, setFormSubmitted] = useState(false);
+const FormRenderer = ({
+  formId,
+  draftId = null,
+  apiUrl = process.env.API_URL || "",
+}) => {
+  // State management
+  const [formTemplate, setFormTemplate] = useState(null);
+  const [formData, setFormData] = useState({});
+  const [currentStep, setCurrentStep] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const [validationErrors, setValidationErrors] = useState({});
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isDraft, setIsDraft] = useState(false);
+  const [lastSaved, setLastSaved] = useState(null);
+  const [formSubmitted, setFormSubmitted] = useState(false);
 
-  // Initialize form or load draft
+  // Custom hooks
+  const { isOffline, wasOffline } = useOfflineStatus();
+
+  // Auto-save functionality
+  const { isSaving, lastAutoSave, triggerSave } = useAutoSave({
+    data: formData,
+    saveFunction: async (data) => {
+      if (!formTemplate || !formTemplate.id) return null;
+
+      try {
+        const saveData = {
+          formId: formTemplate.id,
+          data,
+          currentStep,
+          updatedAt: new Date().toISOString(),
+        };
+
+        if (draftId) {
+          saveData.id = draftId;
+        }
+
+        const savedId = await formDataService.saveDraft(saveData);
+        setLastSaved(new Date().toISOString());
+        setIsDraft(true);
+
+        if (!draftId && savedId) {
+          // Update URL to include draft ID for new drafts
+          route(
+            `/form/${formTemplate.projectId}/${formTemplate.id}/draft/${savedId}`,
+            true
+          );
+        }
+
+        return savedId;
+      } catch (err) {
+        console.error("Error auto-saving form:", err);
+        return null;
+      }
+    },
+    debounceMs: 2000, // Auto-save after 2 seconds of inactivity
+    enabled: !!formTemplate,
+  });
+
+  // Process the form template with conditional logic applied
+  const processedTemplate = useMemo(() => {
+    if (!formTemplate) return null;
+    return formTemplateService.processTemplate(formTemplate, formData);
+  }, [formTemplate, formData]);
+
+  // Load form template and draft if available
   useEffect(() => {
-    if (formDefinition) {
-      if (draftId) {
-        loadDraft(draftId);
-      } else {
-        initForm(
-          formDefinition.id,
-          formDefinition.projectId,
-          formDefinition.steps.length
+    async function loadFormAndData() {
+      try {
+        setLoading(true);
+        setError(null);
+
+        // Load the form template
+        const template = await formTemplateService.getOrFetchFormTemplate(
+          formId,
+          apiUrl
         );
+
+        if (!template) {
+          throw new Error(`Form template with ID ${formId} not found`);
+        }
+
+        setFormTemplate(template);
+
+        // If we have a draft ID, load the draft
+        if (draftId) {
+          const draft = await formDataService.getDraft(draftId);
+
+          if (draft) {
+            setFormData(draft.data || {});
+            setCurrentStep(draft.currentStep || 0);
+            setLastSaved(draft.updatedAt);
+            setIsDraft(true);
+          } else {
+            console.warn(
+              `Draft with ID ${draftId} not found, starting with empty form`
+            );
+          }
+        }
+      } catch (err) {
+        console.error("Error loading form:", err);
+        setError(err.message || "Failed to load form. Please try again.");
+      } finally {
+        setLoading(false);
       }
     }
-  }, [formDefinition, draftId, initForm, loadDraft]);
 
-  // Handle validation for the current step
-  const validateCurrentStep = () => {
-    const currentStepFields = formDefinition.steps[currentStep].fields;
-    const errors = {};
-    let isValid = true;
+    loadFormAndData();
+  }, [formId, draftId, apiUrl]);
 
-    currentStepFields.forEach((field) => {
-      // Skip validation if field is not required
-      if (!field.required) return;
+  // Handle field change
+  const handleFieldChange = (name, value) => {
+    setFormData((prevData) => {
+      const newData = { ...prevData, [name]: value };
 
-      const value = formData[field.name];
-
-      // Check if value is empty
-      if (value === undefined || value === null || value === "") {
-        errors[field.name] = `${field.label} is required`;
-        isValid = false;
+      // Clear validation error for this field if it exists
+      if (validationErrors[name]) {
+        setValidationErrors((prev) => {
+          const newErrors = { ...prev };
+          delete newErrors[name];
+          return newErrors;
+        });
       }
 
-      // Additional validations based on field type
-      if (field.type === "email" && value && !/^\S+@\S+\.\S+$/.test(value)) {
-        errors[field.name] = "Please enter a valid email address";
-        isValid = false;
-      }
-
-      if (field.type === "tel" && value && !/^\d{10,15}$/.test(value)) {
-        errors[field.name] = "Please enter a valid phone number";
-        isValid = false;
-      }
-
-      // Custom validation if provided
-      if (field.validation && value) {
-        const pattern = new RegExp(field.validation.pattern);
-        if (!pattern.test(value)) {
-          errors[field.name] = field.validation.message || "Invalid input";
-          isValid = false;
-        }
-      }
+      return newData;
     });
+  };
 
-    setValidationErrors(errors);
-    return isValid;
+  // Validate current step
+  const validateCurrentStep = () => {
+    if (!processedTemplate || !processedTemplate.steps[currentStep]) {
+      return { isValid: false, errors: { _form: "Invalid form step" } };
+    }
+
+    const stepSchema = processedTemplate.steps[currentStep];
+    const result = validator.validateStep(formData, stepSchema);
+
+    setValidationErrors(result.errors);
+    return result;
   };
 
   // Handle next step
-  const handleNext = () => {
-    if (validateCurrentStep()) {
-      if (currentStep < formDefinition.steps.length - 1) {
-        setStep(currentStep + 1);
+  const handleNextStep = () => {
+    const { isValid } = validateCurrentStep();
+
+    if (isValid) {
+      if (currentStep < (processedTemplate?.steps.length - 1 || 0)) {
+        setCurrentStep((prev) => prev + 1);
+        window.scrollTo(0, 0);
       }
     }
   };
 
   // Handle previous step
-  const handlePrev = () => {
+  const handlePreviousStep = () => {
     if (currentStep > 0) {
-      setStep(currentStep - 1);
+      setCurrentStep((prev) => prev - 1);
+      window.scrollTo(0, 0);
     }
   };
 
-  // Handle manual save
-  const handleSave = async () => {
-    await saveDraft();
-  };
+  // Save draft manually
+  const handleSaveDraft = async () => {
+    try {
+      const savedId = await triggerSave(formData);
 
-  // Handle submit
-  const handleSubmit = async () => {
-    if (validateCurrentStep()) {
-      const formDataId = await submitForm();
-      if (formDataId) {
-        setFormSubmitted(true);
+      if (savedId) {
+        alert("Draft saved successfully");
       }
+    } catch (err) {
+      console.error("Error saving draft:", err);
+      setError("Failed to save draft. Please try again.");
     }
   };
 
-  // Render field based on its type
-  const renderField = (field) => {
-    const props = {
-      id: field.name,
-      name: field.name,
-      label: field.label,
-      value: formData[field.name] || "",
-      onChange: (value) => updateField(field.name, value),
-      required: field.required,
-      placeholder: field.placeholder,
-      hint: field.hint,
-      error: validationErrors[field.name],
-      disabled: isSubmitting,
-      ...field.props,
-    };
+  // Submit form
+  const handleSubmit = async () => {
+    const { isValid, errors } = validateCurrentStep();
 
-    switch (field.type) {
-      case "text":
-      case "email":
-      case "tel":
-      case "number":
-      case "date":
-        return <TextInput {...props} type={field.type} />;
+    if (!isValid) {
+      setValidationErrors(errors);
+      return;
+    }
 
-      case "toggle":
-        return <ToggleInput {...props} />;
+    try {
+      setIsSubmitting(true);
 
-      case "radio":
-        return <RadioInput {...props} options={field.options} />;
+      // Create submission data
+      const submissionData = {
+        formId: formTemplate.id,
+        projectId: formTemplate.projectId,
+        data: formData,
+        createdAt: new Date().toISOString(),
+        version: formTemplate.version,
+      };
 
-      case "checkbox":
-        return <CheckboxInput {...props} options={field.options} />;
+      // Submit the form
+      const result = await formDataService.submitForm(submissionData);
 
-      case "select":
-        return <SelectInput {...props} options={field.options} />;
+      // If we were working with a draft, delete it
+      if (draftId) {
+        await formDataService.deleteDraft(draftId);
+      }
 
-      case "image-capture":
-        return <ImageCaptureInput {...props} />;
+      // Mark as submitted
+      setFormSubmitted(true);
+      setIsDraft(false);
 
-      case "media-upload":
-        return <MediaUploadInput {...props} accept={field.accept} />;
+      // Trigger sync if online
+      if (!isOffline) {
+        syncService.triggerSync();
+      }
 
-      case "address":
-        return <AddressInput {...props} />;
+      return result;
+    } catch (err) {
+      console.error("Error submitting form:", err);
+      setError(
+        "Failed to submit form. " +
+          (isOffline
+            ? "Your data has been saved locally and will be submitted when you are online."
+            : "Please try again.")
+      );
 
-      case "geolocation":
-        return <GeolocationInput {...props} />;
-
-      default:
-        return <TextInput {...props} />;
+      // Save as draft if submission fails
+      await handleSaveDraft();
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
-  // If loading, show loading state
-  if (isLoading) {
+  // Clear error
+  const clearError = () => {
+    setError(null);
+  };
+
+  // Start a new form
+  const handleStartNewForm = () => {
+    route(`/form/${formTemplate.projectId}/${formTemplate.id}`);
+    window.location.reload(); // Ensure clean state
+  };
+
+  // Loading state
+  if (loading) {
     return (
-      <div className="flex items-center justify-center p-8">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+      <div className="container mx-auto p-4">
+        <LoadingIndicator message="Loading form..." />
       </div>
     );
   }
 
-  // If form is submitted, show success message
+  // Error state
+  if (error && !formTemplate) {
+    return (
+      <div className="container mx-auto p-4">
+        <ErrorDisplay
+          title="Error Loading Form"
+          message={error}
+          onRetry={() => window.location.reload()}
+          onBack={() => route("/")}
+        />
+      </div>
+    );
+  }
+
+  // No template found
+  if (!formTemplate) {
+    return (
+      <div className="container mx-auto p-4">
+        <ErrorDisplay
+          title="Form Not Found"
+          message="The form you're looking for doesn't exist or has been removed."
+          onBack={() => route("/")}
+        />
+      </div>
+    );
+  }
+
+  // Form submitted successfully
   if (formSubmitted) {
     return (
-      <div className="flex flex-col items-center justify-center p-8 text-center">
-        <div className="w-16 h-16 mb-4 flex items-center justify-center rounded-full bg-green-100">
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            className="h-10 w-10 text-green-500"
-            viewBox="0 0 20 20"
-            fill="currentColor"
-          >
-            <path
-              fill-rule="evenodd"
-              d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-              clip-rule="evenodd"
-            />
-          </svg>
-        </div>
-        <h2 className="text-2xl font-bold text-gray-800 mb-2">
-          Form Submitted Successfully!
-        </h2>
-        <p className="text-gray-600 mb-6">
-          Your information has been recorded.
-        </p>
-        <button
-          onClick={() => window.location.reload()}
-          className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-        >
-          Complete Another Form
-        </button>
+      <div className="container mx-auto p-4">
+        <SuccessDisplay
+          title="Form Submitted Successfully"
+          message="Thank you! Your information has been submitted."
+          buttonText="Complete Another Form"
+          onButtonClick={handleStartNewForm}
+        />
       </div>
     );
   }
 
-  // Render the form
+  // Current step
+  const currentStepData = processedTemplate?.steps[currentStep];
+
   return (
-    <div className="bg-white rounded-lg shadow-md overflow-hidden">
-      {/* Form header */}
-      <div className="bg-gray-50 px-6 py-4 border-b">
-        <h1 className="text-xl font-semibold text-gray-800">
-          {formDefinition.title}
-        </h1>
-        <p className="text-sm text-gray-600 mt-1">
-          {formDefinition.description}
-        </p>
-      </div>
+    <div className="container mx-auto p-4">
+      <div className="bg-white rounded-lg shadow-md overflow-hidden">
+        {/* Form header */}
+        <div className="bg-gray-50 px-6 py-4 border-b">
+          <h1 className="text-xl font-semibold text-gray-800">
+            {formTemplate.title}
+          </h1>
+          <p className="text-sm text-gray-600 mt-1">
+            {formTemplate.description}
+          </p>
 
-      {/* Form content */}
-      <div className="p-6">
-        {/* Stepper */}
-        <FormStepper steps={formDefinition.steps} />
+          {/* Offline indicator */}
+          {isOffline && (
+            <div className="mt-2 text-sm bg-yellow-50 text-yellow-800 p-2 rounded border border-yellow-200">
+              You are currently offline. Your data will be saved locally and
+              submitted when you're back online.
+            </div>
+          )}
 
-        {/* Error message */}
-        {error && (
-          <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-md">
-            <div className="flex">
+          {/* Recently came back online indicator */}
+          {!isOffline && wasOffline && (
+            <div className="mt-2 text-sm bg-green-50 text-green-800 p-2 rounded border border-green-200">
+              You are back online. Any saved data will be synchronized
+              automatically.
+            </div>
+          )}
+        </div>
+
+        {/* Form content */}
+        <div className="p-6">
+          {/* Stepper */}
+          {processedTemplate.steps.length > 1 && (
+            <FormStepper
+              steps={processedTemplate.steps}
+              currentStep={currentStep}
+              onChange={setCurrentStep}
+              formData={formData}
+            />
+          )}
+
+          {/* Error message */}
+          {error && (
+            <div className="mb-6">
+              <ErrorDisplay message={error} onClose={clearError} />
+            </div>
+          )}
+
+          {/* Last saved message */}
+          {lastSaved && isDraft && (
+            <div className="mb-4 flex items-center text-sm text-gray-500">
               <svg
                 xmlns="http://www.w3.org/2000/svg"
-                className="h-5 w-5 text-red-400 mr-2"
+                className="h-4 w-4 mr-1"
                 viewBox="0 0 20 20"
                 fill="currentColor"
               >
                 <path
-                  fill-rule="evenodd"
-                  d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z"
-                  clip-rule="evenodd"
+                  fillRule="evenodd"
+                  d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v3.586L7.707 9.293a1 1 0 00-1.414 1.414l3 3a1 1 0 001.414 0l3-3a1 1 0 00-1.414-1.414L11 10.586V7z"
+                  clipRule="evenodd"
                 />
               </svg>
-              <span className="text-red-700">{error}</span>
+              Last saved: {new Date(lastSaved).toLocaleString()}
+              {isSaving && <span className="ml-2">(Saving...)</span>}
             </div>
-            <button
-              className="mt-2 text-red-600 text-sm hover:underline focus:outline-none"
-              onClick={clearError}
-            >
-              Dismiss
-            </button>
-          </div>
-        )}
-
-        {/* Last saved message */}
-        {lastSaved && (
-          <div className="mb-6 text-sm text-gray-500 flex items-center">
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              className="h-4 w-4 mr-1"
-              viewBox="0 0 20 20"
-              fill="currentColor"
-            >
-              <path
-                fill-rule="evenodd"
-                d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-                clip-rule="evenodd"
-              />
-            </svg>
-            <span>Last saved: {new Date(lastSaved).toLocaleString()}</span>
-          </div>
-        )}
-
-        {/* Current step fields */}
-        <div>
-          <h2 className="text-lg font-medium text-gray-800 mb-4">
-            {formDefinition.steps[currentStep].title}
-          </h2>
-          {formDefinition.steps[currentStep].description && (
-            <p className="text-sm text-gray-600 mb-6">
-              {formDefinition.steps[currentStep].description}
-            </p>
           )}
 
-          <div className="space-y-6">
-            {formDefinition.steps[currentStep].fields.map((field) => (
-              <div key={field.name} className="form-field">
-                {renderField(field)}
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
+          {/* Current step */}
+          {currentStepData && (
+            <div>
+              <h2 className="text-lg font-medium text-gray-800 mb-4">
+                {currentStepData.title}
+              </h2>
 
-      {/* Form footer with actions */}
-      <div className="px-6 py-4 bg-gray-50 border-t flex items-center justify-between">
-        {/* Navigation buttons */}
-        <div>
-          {currentStep > 0 && (
-            <button
-              type="button"
-              onClick={handlePrev}
-              disabled={isSubmitting}
-              className="px-4 py-2 border border-gray-300 rounded-md text-gray-700 mr-2 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 disabled:opacity-50"
-            >
-              Previous
-            </button>
-          )}
-
-          {currentStep < formDefinition.steps.length - 1 ? (
-            <button
-              type="button"
-              onClick={handleNext}
-              disabled={isSubmitting}
-              className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 disabled:opacity-50"
-            >
-              Next
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={handleSubmit}
-              disabled={isSubmitting}
-              className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 disabled:opacity-50 flex items-center"
-            >
-              {isSubmitting ? (
-                <>
-                  <span className="animate-spin h-4 w-4 mr-2 border-b-2 border-white rounded-full"></span>
-                  Submitting...
-                </>
-              ) : (
-                "Submit"
+              {currentStepData.description && (
+                <p className="text-sm text-gray-600 mb-6">
+                  {currentStepData.description}
+                </p>
               )}
-            </button>
+
+              <FormStep
+                step={currentStepData}
+                formData={formData}
+                onChange={handleFieldChange}
+                errors={validationErrors}
+                disabled={isSubmitting}
+              />
+            </div>
           )}
         </div>
 
-        {/* Save draft button */}
-        <button
-          type="button"
-          onClick={handleSave}
-          disabled={isSubmitting || isSaving}
-          className="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 disabled:opacity-50 flex items-center"
-        >
-          {isSaving ? (
-            <>
-              <span className="animate-spin h-4 w-4 mr-2 border-b-2 border-gray-600 rounded-full"></span>
-              Saving...
-            </>
-          ) : (
-            "Save Draft"
-          )}
-        </button>
-      </div>
-
-      {/* Offline indicator */}
-      <div
-        id="offline-indicator"
-        className="hidden fixed bottom-4 right-4 bg-yellow-100 border border-yellow-400 text-yellow-800 px-4 py-2 rounded-md shadow-lg"
-      >
-        You are currently offline. Your data will be saved and synced when
-        you're back online.
+        {/* Form navigation */}
+        <div className="px-6 py-4 bg-gray-50 border-t">
+          <FormNavigation
+            currentStep={currentStep}
+            totalSteps={processedTemplate.steps.length}
+            onPrevious={handlePreviousStep}
+            onNext={handleNextStep}
+            onSave={handleSaveDraft}
+            onSubmit={handleSubmit}
+            isSubmitting={isSubmitting}
+            isSaving={isSaving}
+            isLastStep={currentStep === processedTemplate.steps.length - 1}
+          />
+        </div>
       </div>
     </div>
   );

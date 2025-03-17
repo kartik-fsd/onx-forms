@@ -1,104 +1,157 @@
-import { useForm } from "../../../context/formContext";
+import { lazy, Suspense } from "preact/compat";
+import LoadingIndicator from "../../layout/LoadingIndicator";
 
-const FormStepper = ({ steps, disableNavigation = false }) => {
-  const { currentStep, setStep, formData } = useForm();
+// Import basic input components directly for quick loading
+import TextInput from "../inputs/TextInput";
+import RadioInput from "../inputs/RadioInput";
+import CheckboxInput from "../inputs/CheckboxInput";
+import SelectInput from "../inputs/SelectInput";
+import ToggleInput from "../inputs/ToggleInput";
 
-  // Function to check if a step is complete (has all required fields)
-  const isStepComplete = (stepIndex) => {
-    const step = steps[stepIndex];
-    if (!step || !step.fields) return false;
+// Lazily load more complex components to improve initial load time
+const MediaUploadInput = lazy(() => import("../inputs/MediaUploadInput"));
+const ImageCaptureInput = lazy(() => import("../inputs/ImageCaptureInput"));
+const VideoRecorderInput = lazy(() => import("../inputs/VideoRecorderInput"));
+const AudioRecorderInput = lazy(() => import("../inputs/AudioRecorderInput"));
+const GeoLocationInput = lazy(() => import("../inputs/GeoLocation"));
+const AddressInput = lazy(() => import("../inputs/AddressInput"));
+const SignatureInput = lazy(() => import("../inputs/SignatureInput"));
 
-    return step.fields.every((field) => {
-      // Skip if not required
-      if (!field.required) return true;
+// Component to render a form step with all its fields
+const FormStep = ({
+  step,
+  formData,
+  onChange,
+  errors = {},
+  disabled = false,
+}) => {
+  // If no step provided, return null
+  if (!step || !step.fields) {
+    return null;
+  }
 
-      // Check if the field has a value
-      const value = formData[field.name];
-      return value !== undefined && value !== null && value !== "";
-    });
-  };
+  // Function to render the appropriate input component based on field type
+  const renderField = (field) => {
+    const {
+      id,
+      name,
+      type,
+      label,
+      required,
+      placeholder,
+      hint,
+      options,
+      props = {},
+    } = field;
 
-  // Function to determine if user can navigate to a step
-  const canNavigateToStep = (stepIndex) => {
-    if (disableNavigation) return false;
-    if (stepIndex === currentStep) return true; // Current step is always navigable
-    if (stepIndex < currentStep) return true; // Previous steps are always navigable
+    // Common props for all input types
+    const commonProps = {
+      id: id || name,
+      name,
+      label,
+      value: formData[name] || "",
+      onChange: (value) => onChange(name, value),
+      error: errors[name],
+      required,
+      placeholder,
+      hint,
+      disabled,
+      ...props,
+    };
 
-    // For future steps, all previous steps must be complete
-    for (let i = 0; i < stepIndex; i++) {
-      if (!isStepComplete(i)) return false;
-    }
+    // Render the appropriate component based on type
+    switch (type) {
+      case "text":
+      case "email":
+      case "tel":
+      case "url":
+      case "number":
+      case "date":
+        return <TextInput {...commonProps} type={type} />;
 
-    return true;
-  };
+      case "textarea":
+        return <TextInput {...commonProps} type="textarea" />;
 
-  const handleStepClick = (index) => {
-    if (canNavigateToStep(index)) {
-      setStep(index);
+      case "radio":
+        return <RadioInput {...commonProps} options={options || []} />;
+
+      case "checkbox":
+        return <CheckboxInput {...commonProps} options={options || []} />;
+
+      case "select":
+        return <SelectInput {...commonProps} options={options || []} />;
+
+      case "toggle":
+        return <ToggleInput {...commonProps} />;
+
+      // Complex components with lazy loading
+      case "image-capture":
+        return (
+          <Suspense fallback={<LoadingIndicator size="small" />}>
+            <ImageCaptureInput {...commonProps} />
+          </Suspense>
+        );
+
+      case "video-recorder":
+        return (
+          <Suspense fallback={<LoadingIndicator size="small" />}>
+            <VideoRecorderInput {...commonProps} />
+          </Suspense>
+        );
+
+      case "audio-recorder":
+        return (
+          <Suspense fallback={<LoadingIndicator size="small" />}>
+            <AudioRecorderInput {...commonProps} />
+          </Suspense>
+        );
+
+      case "media-upload":
+        return (
+          <Suspense fallback={<LoadingIndicator size="small" />}>
+            <MediaUploadInput {...commonProps} />
+          </Suspense>
+        );
+
+      case "geolocation":
+        return (
+          <Suspense fallback={<LoadingIndicator size="small" />}>
+            <GeoLocationInput {...commonProps} />
+          </Suspense>
+        );
+
+      case "address":
+        return (
+          <Suspense fallback={<LoadingIndicator size="small" />}>
+            <AddressInput {...commonProps} />
+          </Suspense>
+        );
+
+      case "signature":
+        return (
+          <Suspense fallback={<LoadingIndicator size="small" />}>
+            <SignatureInput {...commonProps} />
+          </Suspense>
+        );
+
+      // Default to text input if type not recognized
+      default:
+        console.warn(
+          `Unrecognized field type: ${type}, using text input as fallback`
+        );
+        return <TextInput {...commonProps} />;
     }
   };
 
   return (
-    <div className="mb-6">
-      <div className="flex items-center justify-between">
-        {steps.map((step, index) => (
-          <div key={index} className="flex flex-col items-center w-full">
-            <div
-              className={`relative flex items-center justify-center w-10 h-10 rounded-full 
-                ${
-                  index === currentStep
-                    ? "bg-blue-600 text-white"
-                    : isStepComplete(index)
-                    ? "bg-green-500 text-white"
-                    : "bg-gray-200 text-gray-700"
-                }
-                ${
-                  canNavigateToStep(index)
-                    ? "cursor-pointer hover:opacity-80"
-                    : "cursor-not-allowed opacity-50"
-                }
-                transition-all duration-200`}
-              onClick={() => handleStepClick(index)}
-              role={canNavigateToStep(index) ? "button" : "presentation"}
-              aria-current={index === currentStep ? "step" : undefined}
-              aria-label={`Step ${index + 1}: ${step.title}`}
-            >
-              {isStepComplete(index) ? (
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="w-6 h-6"
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                >
-                  <path
-                    fill-rule="evenodd"
-                    d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-                    clip-rule="evenodd"
-                  />
-                </svg>
-              ) : (
-                <span>{index + 1}</span>
-              )}
-            </div>
-
-            {/* Line connector */}
-            {index < steps.length - 1 && (
-              <div className="w-full h-1 bg-gray-200 mt-5">
-                <div
-                  className={`h-full ${
-                    isStepComplete(index) ? "bg-green-500" : "bg-gray-200"
-                  }`}
-                  style={{ width: `${isStepComplete(index) ? "100%" : "0%"}` }}
-                />
-              </div>
-            )}
-
-            <span className="mt-2 text-xs text-center">{step.title}</span>
-          </div>
-        ))}
-      </div>
+    <div className="space-y-6">
+      {step.fields.map((field, index) => (
+        <div key={field.id || field.name || index} className="form-field">
+          {renderField(field)}
+        </div>
+      ))}
     </div>
   );
 };
 
-export default FormStepper;
+export default FormStep;

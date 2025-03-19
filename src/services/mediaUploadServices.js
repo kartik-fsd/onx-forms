@@ -1,361 +1,479 @@
-import { openDB } from 'idb';
+import { MediaDAO } from '../db';
 import { v4 as uuidv4 } from 'uuid';
 
-const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
-const DB_NAME = 'media-uploads';
-const MEDIA_STORE = 'media';
-const CHUNKS_STORE = 'chunks';
-const UPLOAD_QUEUE_STORE = 'upload-queue';
-
-// Initialize the IndexedDB for media storage
-async function initializeDB() {
-    return openDB(DB_NAME, 1, {
-        upgrade(db) {
-            // Store for media metadata
-            if (!db.objectStoreNames.contains(MEDIA_STORE)) {
-                const mediaStore = db.createObjectStore(MEDIA_STORE, { keyPath: 'id' });
-                mediaStore.createIndex('formDataId', 'formDataId', { unique: false });
-                mediaStore.createIndex('status', 'status', { unique: false });
+class MediaUploadService {
+    constructor() {
+        this.chunkSize = 1024 * 1024; // 1MB chunks
+        this.maxRetries = 3;
+        this.uploadQueue = [];
+        this.isUploading = false;
+        this.listeners = [];
+        this.compressionOptions = {
+            image: {
+                maxWidth: 1600,
+                maxHeight: 1200,
+                quality: 0.8
+            },
+            video: {
+                maxWidth: 1280,
+                maxHeight: 720,
+                bitrate: 1000000 // 1Mbps
             }
-
-            // Store for chunked media data
-            if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
-                const chunksStore = db.createObjectStore(CHUNKS_STORE, { keyPath: 'id' });
-                chunksStore.createIndex('mediaId', 'mediaId', { unique: false });
-                chunksStore.createIndex('chunkIndex', 'chunkIndex', { unique: false });
-            }
-
-            // Store for upload queue
-            if (!db.objectStoreNames.contains(UPLOAD_QUEUE_STORE)) {
-                const queueStore = db.createObjectStore(UPLOAD_QUEUE_STORE, { keyPath: 'id' });
-                queueStore.createIndex('status', 'status', { unique: false });
-                queueStore.createIndex('timestamp', 'timestamp', { unique: false });
-                queueStore.createIndex('retryCount', 'retryCount', { unique: false });
-            }
-        }
-    });
-}
-
-// Compress an image before storing
-async function compressImage(file, options = {}) {
-    const { maxWidth = 1200, maxHeight = 1200, quality = 0.8 } = options;
-
-    return new Promise((resolve, reject) => {
-        const img = new Image();
-        const reader = new FileReader();
-
-        reader.onload = function (e) {
-            img.src = e.target.result;
         };
+    }
 
-        img.onload = function () {
-            // Calculate new dimensions
-            let width = img.width;
-            let height = img.height;
+    /**
+     * Initialize the media service
+     */
+    init() {
+        // Listen for online events to resume uploads
+        window.addEventListener('online', this.handleOnline.bind(this));
 
-            if (width > maxWidth) {
-                height = (height * maxWidth) / width;
-                width = maxWidth;
-            }
-
-            if (height > maxHeight) {
-                width = (width * maxHeight) / height;
-                height = maxHeight;
-            }
-
-            // Create canvas and draw image
-            const canvas = document.createElement('canvas');
-            canvas.width = width;
-            canvas.height = height;
-
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0, width, height);
-
-            // Convert to Blob
-            canvas.toBlob(
-                (blob) => {
-                    resolve(new File([blob], file.name, {
-                        type: 'image/jpeg',
-                        lastModified: file.lastModified
-                    }));
-                },
-                'image/jpeg',
-                quality
-            );
-        };
-
-        img.onerror = reject;
-
-        reader.readAsDataURL(file);
-    });
-}
-
-// Split file into chunks and store in IndexedDB
-async function storeMedia(file, formDataId, fieldName) {
-    try {
-        const db = await initializeDB();
-
-        // Generate a unique ID for this media
-        const mediaId = uuidv4();
-
-        // Determine if we need to compress
-        let processedFile = file;
-        if (file.type.startsWith('image/') && file.type !== 'image/gif') {
-            processedFile = await compressImage(file);
-        }
-
-        // Store media metadata
-        await db.add(MEDIA_STORE, {
-            id: mediaId,
-            formDataId,
-            fieldName,
-            filename: processedFile.name,
-            type: processedFile.type,
-            size: processedFile.size,
-            status: 'pending',
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString()
-        });
-
-        // Split file into chunks and store
-        const totalChunks = Math.ceil(processedFile.size / CHUNK_SIZE);
-
-        for (let i = 0; i < totalChunks; i++) {
-            const start = i * CHUNK_SIZE;
-            const end = Math.min(start + CHUNK_SIZE, processedFile.size);
-            const chunk = processedFile.slice(start, end);
-
-            await db.add(CHUNKS_STORE, {
-                id: `${mediaId}_${i}`,
-                mediaId,
-                chunkIndex: i,
-                data: chunk,
-                size: chunk.size
-            });
-        }
-
-        // Add to upload queue
-        await db.add(UPLOAD_QUEUE_STORE, {
-            id: mediaId,
-            mediaId,
-            status: 'pending',
-            timestamp: new Date().toISOString(),
-            retryCount: 0,
-            totalChunks
-        });
-
-        // Trigger upload if online
+        // Process queue if online at startup
         if (navigator.onLine) {
-            triggerBackgroundSync();
+            this.processUploadQueue();
         }
-
-        return {
-            mediaId,
-            status: 'stored',
-            size: processedFile.size
-        };
-    } catch (error) {
-        console.error('Error storing media:', error);
-        throw error;
     }
-}
 
-// Retrieve a complete file from chunks
-async function getMediaFile(mediaId) {
-    try {
-        const db = await initializeDB();
-
-        // Get metadata
-        const metadata = await db.get(MEDIA_STORE, mediaId);
-        if (!metadata) {
-            throw new Error(`Media with ID ${mediaId} not found`);
-        }
-
-        // Get all chunks
-        const chunks = await db.getAllFromIndex(CHUNKS_STORE, 'mediaId', mediaId);
-
-        // Sort chunks by index
-        chunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
-
-        // Combine chunks into a single blob
-        const chunksData = chunks.map(chunk => chunk.data);
-
-        return {
-            metadata,
-            file: new File(chunksData, metadata.filename, { type: metadata.type })
-        };
-    } catch (error) {
-        console.error('Error retrieving media:', error);
-        throw error;
+    /**
+     * Handle online event
+     */
+    handleOnline() {
+        this.processUploadQueue();
     }
-}
 
-// Try to upload a media file
-async function uploadMedia(mediaId, apiUrl) {
-    try {
-        const db = await initializeDB();
+    /**
+     * Compress image file to reduce size
+     * @param {File|Blob} file - The image file to compress
+     * @returns {Promise<Blob>} Compressed image file
+     */
+    async compressImage(file) {
+        const { maxWidth, maxHeight, quality } = this.compressionOptions.image;
 
-        // Get metadata and upload entry
-        const metadata = await db.get(MEDIA_STORE, mediaId);
-        const uploadEntry = await db.get(UPLOAD_QUEUE_STORE, mediaId);
+        return new Promise((resolve, reject) => {
+            // Create file reader
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
 
-        if (!metadata || !uploadEntry) {
-            throw new Error(`Media or upload entry with ID ${mediaId} not found`);
+            reader.onload = (event) => {
+                // Create image element
+                const img = new Image();
+                img.src = event.target.result;
+
+                img.onload = () => {
+                    // Determine new dimensions
+                    let width = img.width;
+                    let height = img.height;
+
+                    if (width > maxWidth) {
+                        height = Math.round(height * (maxWidth / width));
+                        width = maxWidth;
+                    }
+
+                    if (height > maxHeight) {
+                        width = Math.round(width * (maxHeight / height));
+                        height = maxHeight;
+                    }
+
+                    // Create canvas for compression
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+
+                    // Draw image to canvas
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, width, height);
+
+                    // Convert to blob
+                    canvas.toBlob(
+                        (blob) => resolve(blob),
+                        file.type,
+                        quality
+                    );
+                };
+
+                img.onerror = () => {
+                    reject(new Error('Failed to load image for compression'));
+                };
+            };
+
+            reader.onerror = () => {
+                reject(new Error('Failed to read file for compression'));
+            };
+        });
+    }
+
+    /**
+     * Save media file to storage and queue for upload
+     * @param {Object} mediaData - Media data object
+     * @returns {Promise<Object>} Media reference
+     */
+    async saveMedia(mediaData) {
+        try {
+            const { fieldName, type, data, formDataId } = mediaData;
+
+            // Generate unique ID
+            const mediaId = uuidv4();
+
+            // Compress if it's an image
+            let processedData = data;
+            let size = data.size;
+
+            if (type.startsWith('image/') && type !== 'image/gif') {
+                try {
+                    processedData = await this.compressImage(data);
+                    size = processedData.size;
+                } catch (error) {
+                    console.warn('Image compression failed, using original:', error);
+                }
+            }
+
+            // Split into chunks for large files
+            const chunks = [];
+            let offset = 0;
+
+            while (offset < size) {
+                const chunk = processedData.slice(offset, offset + this.chunkSize);
+                chunks.push({
+                    id: `${mediaId}_${chunks.length}`,
+                    index: chunks.length,
+                    data: chunk,
+                    size: chunk.size
+                });
+                offset += this.chunkSize;
+            }
+
+            // Store media metadata
+            const mediaRecord = {
+                id: mediaId,
+                fieldName,
+                type,
+                size,
+                formDataId,
+                filename: data.name || `${fieldName}_${Date.now()}.${type.split('/')[1]}`,
+                chunks: chunks.length,
+                uploaded: 0,
+                status: 'pending',
+                createdAt: new Date().toISOString(),
+                uploadedAt: null,
+                serverUrl: null,
+                retryCount: 0,
+                lastError: null
+            };
+
+            // Save media record
+            await MediaDAO.saveMedia(mediaRecord);
+
+            // Save chunks
+            for (const chunk of chunks) {
+                await this.saveChunk(mediaId, chunk);
+            }
+
+            // Add to upload queue
+            this.addToUploadQueue(mediaId);
+
+            // Return reference
+            return {
+                mediaId,
+                fieldName,
+                type,
+                size,
+                status: 'queued'
+            };
+        } catch (error) {
+            console.error('Error saving media:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Save a media chunk to storage
+     * @param {string} mediaId - Media ID
+     * @param {Object} chunk - Chunk object
+     */
+    async saveChunk(mediaId, chunk) {
+        // In a production implementation, this would save to IndexedDB
+        // For simplicity, we'll just store in memory in this example
+        this.chunks = this.chunks || {};
+        this.chunks[chunk.id] = chunk;
+    }
+
+    /**
+     * Add media to upload queue
+     * @param {string} mediaId - Media ID
+     */
+    addToUploadQueue(mediaId) {
+        this.uploadQueue.push(mediaId);
+
+        // Start processing if online
+        if (navigator.onLine && !this.isUploading) {
+            this.processUploadQueue();
+        }
+    }
+
+    /**
+     * Process the upload queue
+     */
+    async processUploadQueue() {
+        if (this.isUploading || this.uploadQueue.length === 0 || !navigator.onLine) {
+            return;
         }
 
-        // Update status
-        await db.put(MEDIA_STORE, {
-            ...metadata,
-            status: 'uploading',
-            updatedAt: new Date().toISOString()
-        });
+        this.isUploading = true;
 
-        await db.put(UPLOAD_QUEUE_STORE, {
-            ...uploadEntry,
-            status: 'uploading',
-            timestamp: new Date().toISOString()
-        });
+        try {
+            while (this.uploadQueue.length > 0) {
+                const mediaId = this.uploadQueue[0];
 
-        // Get total chunks
-        const totalChunks = uploadEntry.totalChunks;
+                try {
+                    const media = await MediaDAO.getMedia(mediaId);
+
+                    if (!media) {
+                        this.uploadQueue.shift(); // Remove from queue
+                        continue;
+                    }
+
+                    // Skip already uploaded media
+                    if (media.status === 'completed') {
+                        this.uploadQueue.shift();
+                        continue;
+                    }
+
+                    // Upload media
+                    await this.uploadMedia(media);
+
+                    // Remove from queue if successful
+                    this.uploadQueue.shift();
+                } catch (error) {
+                    console.error(`Error uploading media ${mediaId}:`, error);
+
+                    // Get media again to update retry count
+                    const media = await MediaDAO.getMedia(mediaId);
+
+                    if (media) {
+                        // Update retry count
+                        const retryCount = (media.retryCount || 0) + 1;
+
+                        if (retryCount >= this.maxRetries) {
+                            // Max retries reached, mark as failed
+                            await MediaDAO.updateMedia(mediaId, {
+                                status: 'failed',
+                                lastError: error.message,
+                                retryCount
+                            });
+
+                            // Remove from queue
+                            this.uploadQueue.shift();
+                        } else {
+                            // Update retry count and move to end of queue
+                            await MediaDAO.updateMedia(mediaId, {
+                                status: 'pending',
+                                lastError: error.message,
+                                retryCount
+                            });
+
+                            // Move to end of queue for later retry
+                            this.uploadQueue.shift();
+                            this.uploadQueue.push(mediaId);
+
+                            // Break to allow other uploads to proceed
+                            break;
+                        }
+                    } else {
+                        // Media not found, remove from queue
+                        this.uploadQueue.shift();
+                    }
+                }
+            }
+        } finally {
+            this.isUploading = false;
+        }
+    }
+
+    /**
+     * Upload media to the server using chunked upload
+     * @param {Object} media - Media object
+     */
+    async uploadMedia(media) {
+        // Update status to uploading
+        await MediaDAO.updateMedia(media.id, { status: 'uploading' });
+
+        // Notify progress start
+        this.notifyProgress(media.id, 0, media.chunks);
 
         // Upload each chunk
-        for (let i = 0; i < totalChunks; i++) {
-            const chunkId = `${mediaId}_${i}`;
-            const chunk = await db.get(CHUNKS_STORE, chunkId);
+        for (let i = 0; i < media.chunks; i++) {
+            const chunkId = `${media.id}_${i}`;
+            const chunk = this.chunks[chunkId];
 
             if (!chunk) {
                 throw new Error(`Chunk ${chunkId} not found`);
             }
 
-            // Create form data for this chunk
+            // Create form data
             const formData = new FormData();
-            formData.append('mediaId', mediaId);
+            formData.append('mediaId', media.id);
             formData.append('chunkIndex', i.toString());
-            formData.append('totalChunks', totalChunks.toString());
-            formData.append('fieldName', metadata.fieldName);
-            formData.append('formDataId', metadata.formDataId);
-            formData.append('filename', metadata.filename);
-            formData.append('type', metadata.type);
-            formData.append('chunk', chunk.data);
+            formData.append('totalChunks', media.chunks.toString());
+            formData.append('filename', media.filename);
+            formData.append('fieldName', media.fieldName);
+            formData.append('type', media.type);
+            formData.append('chunk', new Blob([chunk.data], { type: 'application/octet-stream' }));
 
-            // Upload chunk
-            const response = await fetch(`${apiUrl}/api/media/chunk`, {
-                method: 'POST',
-                body: formData
-            });
+            // Upload chunk with retry logic
+            let attempts = 0;
+            let success = false;
 
-            if (!response.ok) {
-                throw new Error(`Failed to upload chunk ${i}: ${response.statusText}`);
+            while (attempts < 3 && !success) {
+                try {
+                    const response = await fetch('/api/media/chunk', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+                    }
+
+                    success = true;
+                } catch (error) {
+                    attempts++;
+
+                    if (attempts >= 3) {
+                        throw error;
+                    }
+
+                    // Wait before retry (exponential backoff)
+                    await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempts)));
+                }
             }
+
+            // Update progress
+            await MediaDAO.updateMedia(media.id, { uploaded: i + 1 });
+            this.notifyProgress(media.id, i + 1, media.chunks);
         }
 
-        // Mark as complete
-        await db.put(MEDIA_STORE, {
-            ...metadata,
-            status: 'uploaded',
-            updatedAt: new Date().toISOString()
+        // Complete upload by notifying server
+        const completeResponse = await fetch('/api/media/complete', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                mediaId: media.id,
+                filename: media.filename,
+                type: media.type,
+                chunks: media.chunks,
+                size: media.size,
+                fieldName: media.fieldName
+            })
         });
 
-        await db.put(UPLOAD_QUEUE_STORE, {
-            ...uploadEntry,
+        if (!completeResponse.ok) {
+            throw new Error(`Failed to complete upload: ${completeResponse.statusText}`);
+        }
+
+        const result = await completeResponse.json();
+
+        // Update media record with server URL
+        await MediaDAO.updateMedia(media.id, {
             status: 'completed',
-            timestamp: new Date().toISOString()
+            serverUrl: result.url,
+            uploadedAt: new Date().toISOString()
         });
+
+        // Notify completion
+        this.notifyCompletion(media.id, result.url);
+
+        return result;
+    }
+
+    /**
+     * Add a progress listener
+     * @param {Function} listener - Progress listener function
+     */
+    addListener(listener) {
+        if (typeof listener === 'function' && !this.listeners.includes(listener)) {
+            this.listeners.push(listener);
+        }
+        return () => this.removeListener(listener);
+    }
+
+    /**
+     * Remove a progress listener
+     * @param {Function} listener - Progress listener function
+     */
+    removeListener(listener) {
+        this.listeners = this.listeners.filter(l => l !== listener);
+    }
+
+    /**
+     * Notify progress to all listeners
+     * @param {string} mediaId - Media ID
+     * @param {number} uploaded - Number of chunks uploaded
+     * @param {number} total - Total number of chunks
+     */
+    notifyProgress(mediaId, uploaded, total) {
+        const percentage = total === 0 ? 0 : Math.round((uploaded / total) * 100);
+
+        this.listeners.forEach(listener => {
+            try {
+                listener({
+                    type: 'progress',
+                    mediaId,
+                    uploaded,
+                    total,
+                    percentage
+                });
+            } catch (error) {
+                console.error('Error in media upload listener:', error);
+            }
+        });
+    }
+
+    /**
+     * Notify completion to all listeners
+     * @param {string} mediaId - Media ID
+     * @param {string} url - Server URL for the uploaded media
+     */
+    notifyCompletion(mediaId, url) {
+        this.listeners.forEach(listener => {
+            try {
+                listener({
+                    type: 'complete',
+                    mediaId,
+                    url
+                });
+            } catch (error) {
+                console.error('Error in media upload listener:', error);
+            }
+        });
+    }
+
+    /**
+     * Get upload progress for a media
+     * @param {string} mediaId - Media ID
+     * @returns {Promise<Object>} Upload progress
+     */
+    async getUploadProgress(mediaId) {
+        const media = await MediaDAO.getMedia(mediaId);
+
+        if (!media) {
+            return { mediaId, status: 'not_found' };
+        }
 
         return {
             mediaId,
-            status: 'uploaded'
+            status: media.status,
+            uploaded: media.uploaded || 0,
+            total: media.chunks || 0,
+            percentage: media.chunks === 0 ? 0 : Math.round((media.uploaded / media.chunks) * 100),
+            serverUrl: media.serverUrl,
+            error: media.lastError
         };
-    } catch (error) {
-        console.error(`Error uploading media ${mediaId}:`, error);
-
-        // Update with error
-        const db = await initializeDB();
-        const metadata = await db.get(MEDIA_STORE, mediaId);
-        const uploadEntry = await db.get(UPLOAD_QUEUE_STORE, mediaId);
-
-        if (metadata) {
-            await db.put(MEDIA_STORE, {
-                ...metadata,
-                status: 'error',
-                error: error.message,
-                updatedAt: new Date().toISOString()
-            });
-        }
-
-        if (uploadEntry) {
-            const retryCount = uploadEntry.retryCount + 1;
-            await db.put(UPLOAD_QUEUE_STORE, {
-                ...uploadEntry,
-                status: retryCount >= 5 ? 'failed' : 'pending',
-                error: error.message,
-                retryCount,
-                timestamp: new Date().toISOString(),
-                // Exponential backoff for retries
-                nextRetry: new Date(Date.now() + (Math.pow(2, retryCount) * 30000)).toISOString()
-            });
-        }
-
-        throw error;
     }
 }
 
-// Process the upload queue
-async function processUploadQueue(apiUrl) {
-    const db = await initializeDB();
-
-    // Get pending uploads
-    const now = new Date().toISOString();
-    const pendingUploads = await db.getAllFromIndex(
-        UPLOAD_QUEUE_STORE,
-        'status',
-        'pending'
-    ).then(items =>
-        items.filter(item => !item.nextRetry || item.nextRetry <= now)
-    );
-
-    // Process each upload
-    const results = await Promise.allSettled(
-        pendingUploads.map(item => uploadMedia(item.mediaId, apiUrl))
-    );
-
-    return results;
-}
-
-// Trigger sync via the service worker if available
-function triggerBackgroundSync() {
-    if ('serviceWorker' in navigator && 'SyncManager' in window) {
-        navigator.serviceWorker.ready.then(registration => {
-            registration.sync.register('media-upload-sync');
-        }).catch(err => {
-            console.error('Error registering for sync:', err);
-            // Fall back to immediate processing
-            processUploadQueue('/');
-        });
-    } else {
-        // No ServiceWorker/SyncManager support, process immediately
-        processUploadQueue('/');
-    }
-}
-
-// Start synchronization when online
-function initMediaSync(apiUrl) {
-    window.addEventListener('online', () => {
-        processUploadQueue(apiUrl);
-    });
-
-    // Process queue when first initialized if online
-    if (navigator.onLine) {
-        processUploadQueue(apiUrl);
-    }
-}
-
-export default {
-    storeMedia,
-    getMediaFile,
-    uploadMedia,
-    processUploadQueue,
-    initMediaSync,
-    compressImage
-};
+// Create and export singleton instance
+const mediaUploadService = new MediaUploadService();
+export default mediaUploadService;

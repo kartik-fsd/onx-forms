@@ -1,195 +1,197 @@
+import { SyncQueueDAO } from '../db';
+import { checkApiConnection } from '../api/ApiService.js';
 
-import formDataService from './formDataService';
-import mediaUploadServices from './mediaUploadServices';
-/**
- * Service for handling synchronization of offline data
- */
 class SyncService {
     constructor() {
         this.isSyncing = false;
+        this.syncPromise = null;
         this.listeners = [];
+        this.maxRetryAttempts = 5;
+        this.syncInterval = null;
         this.lastSyncTime = null;
-        this.pendingSync = false;
     }
 
-    /**
-     * Initialize the sync service
-     */
     init() {
-        // Listen for online events to trigger sync
+        // Listen for online events
         window.addEventListener('online', this.handleOnline.bind(this));
 
-        // Register with service worker if available
+        // Set up periodic sync when online
+        this.setupPeriodicSync();
+
+        // Register with service worker
         this.registerWithServiceWorker();
 
-        // Set up message listener for sync messages from service worker
-        this.setupMessageListener();
-
-        // If we're online at startup, schedule an initial sync
+        // Check if we're online at startup
         if (navigator.onLine) {
-            this.scheduleSync();
+            this.scheduleSync(3000); // Schedule sync with a 3-second delay
         }
     }
 
-    /**
-     * Register with the service worker for background sync
-     */
+    setupPeriodicSync(interval = 5 * 60 * 1000) { // Default 5 minutes
+        if (this.syncInterval) {
+            clearInterval(this.syncInterval);
+        }
+
+        this.syncInterval = setInterval(() => {
+            if (navigator.onLine && !this.isSyncing) {
+                this.syncAll();
+            }
+        }, interval);
+    }
+
     async registerWithServiceWorker() {
         if ('serviceWorker' in navigator && 'SyncManager' in window) {
             try {
                 const registration = await navigator.serviceWorker.ready;
 
                 // Register for background sync
-                await registration.sync.register('form-sync');
-                await registration.sync.register('media-upload-sync');
+                await registration.sync.register('sync-forms');
+                await registration.sync.register('sync-media');
 
-                console.log('Registered for background sync');
+                // Listen for messages from service worker
+                navigator.serviceWorker.addEventListener('message', (event) => {
+                    if (event.data) {
+                        switch (event.data.type) {
+                            case 'SYNC_REQUESTED':
+                                this.scheduleSync();
+                                break;
+                            case 'SYNC_COMPLETED':
+                                this.notifyListeners('syncCompleted', event.data);
+                                break;
+                            case 'SYNC_FAILED':
+                                this.notifyListeners('syncFailed', event.data);
+                                break;
+                        }
+                    }
+                });
             } catch (error) {
                 console.error('Failed to register for background sync:', error);
             }
         }
     }
 
-    /**
-     * Set up message listener for service worker messages
-     */
-    setupMessageListener() {
-        if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.addEventListener('message', (event) => {
-                if (event.data) {
-                    switch (event.data.type) {
-                        case 'SYNC_FORMS':
-                            this.syncForms()
-                                .then(() => {
-                                    this.notifyServiceWorker('SYNC_FORMS_COMPLETE');
-                                })
-                                .catch(error => {
-                                    console.error('Error syncing forms:', error);
-                                    this.notifyServiceWorker('SYNC_FORMS_ERROR', { error: error.message });
-                                });
-                            break;
-
-                        case 'SYNC_MEDIA':
-                            this.syncMedia()
-                                .then(() => {
-                                    this.notifyServiceWorker('SYNC_MEDIA_COMPLETE');
-                                })
-                                .catch(error => {
-                                    console.error('Error syncing media:', error);
-                                    this.notifyServiceWorker('SYNC_MEDIA_ERROR', { error: error.message });
-                                });
-                            break;
-
-                        case 'SYNC_COMPLETED':
-                            this.notifyListeners('syncCompleted', event.data);
-                            break;
-
-                        case 'SYNC_FAILED':
-                            this.notifyListeners('syncFailed', event.data);
-                            break;
-                    }
-                }
-            });
-        }
-    }
-
-    /**
-     * Send a message to the service worker
-     * @param {string} type - The message type
-     * @param {Object} data - Additional data to send
-     */
-    notifyServiceWorker(type, data = {}) {
-        if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-            navigator.serviceWorker.controller.postMessage({
-                type,
-                ...data
-            });
-        }
-    }
-
-    /**
-     * Handle online event
-     */
     handleOnline() {
-        console.log('Device is online, scheduling sync');
         this.scheduleSync();
+        this.notifyListeners('networkStatusChanged', { isOnline: true });
     }
 
-    /**
-     * Schedule a sync operation with debouncing
-     */
-    scheduleSync() {
-        // Mark that we have a pending sync
-        this.pendingSync = true;
-
-        // Clear any existing timeout
+    scheduleSync(delay = 1000) {
         if (this.syncTimeout) {
             clearTimeout(this.syncTimeout);
         }
 
-        // Schedule a new sync with a slight delay to avoid multiple syncs
         this.syncTimeout = setTimeout(() => {
             this.syncAll();
-        }, 2000);
+        }, delay);
     }
 
-    /**
-     * Trigger an immediate sync
-     */
-    triggerSync() {
-        if (this.isSyncing) {
-            // If already syncing, just mark as pending
-            this.pendingSync = true;
-            return Promise.resolve();
+    async addToQueue(type, data, priority = 'normal') {
+        // Add timestamp and priority field
+        await SyncQueueDAO.addToQueue({
+            type,
+            data,
+            status: 'pending',
+            priority, // 'high', 'normal', 'low'
+            createdAt: new Date().toISOString(),
+            attempts: 0
+        });
+
+        // If we're online, schedule a sync
+        if (navigator.onLine) {
+            this.scheduleSync();
         }
-
-        return this.syncAll();
     }
 
-    /**
-     * Sync all pending items
-     */
     async syncAll() {
         // Prevent multiple simultaneous syncs
         if (this.isSyncing) {
-            return;
+            return this.syncPromise;
         }
 
         this.isSyncing = true;
-        this.pendingSync = false;
         this.notifyListeners('syncStarted');
 
-        try {
-            // First check if we're online
-            if (!navigator.onLine) {
-                this.notifyListeners('syncFailed', { error: 'Device is offline' });
+        this.syncPromise = (async () => {
+            try {
+                // First check if we're online and API is reachable
+                const isApiReachable = await checkApiConnection();
+                if (!isApiReachable) {
+                    this.notifyListeners('syncFailed', { error: 'API is not reachable' });
+                    return;
+                }
+
+                // First process media uploads
+                const mediaResults = await this.syncMedia();
+
+                // Then process form submissions
+                const formResults = await this.syncForms();
+
+                this.lastSyncTime = new Date().toISOString();
+
+                this.notifyListeners('syncCompleted', {
+                    syncedForms: formResults.syncedItems,
+                    failedForms: formResults.failedItems,
+                    syncedMedia: mediaResults.syncedItems,
+                    failedMedia: mediaResults.failedItems,
+                    timestamp: this.lastSyncTime
+                });
+            } catch (error) {
+                console.error('Sync failed:', error);
+                this.notifyListeners('syncFailed', { error: error.message });
+            } finally {
                 this.isSyncing = false;
-                return;
+                this.syncPromise = null;
+            }
+        })();
+
+        return this.syncPromise;
+    }
+
+    async processItem(item) {
+        // Enhanced with progressive backoff and better error handling
+        try {
+            // Skip if the item has exceeded max retry attempts
+            if (item.attempts >= this.maxRetryAttempts) {
+                await SyncQueueDAO.updateStatus(item.id, 'failed', 'Max retry attempts exceeded');
+                return { status: 'failed', reason: 'Max retries exceeded' };
             }
 
-            // Sync forms first
-            const formResults = await this.syncForms();
+            // Update status to processing
+            await SyncQueueDAO.updateStatus(item.id, 'processing');
 
-            // Then sync media
-            const mediaResults = await this.syncMedia();
+            // Process based on item type
+            let result;
+            switch (item.type) {
+                case 'FORM_SUBMISSION':
+                    result = await this.syncFormSubmission(item);
+                    break;
+                case 'MEDIA_UPLOAD':
+                    result = await this.syncMediaUpload(item);
+                    break;
+                default:
+                    throw new Error(`Unknown sync item type: ${item.type}`);
+            }
 
-            this.lastSyncTime = new Date().toISOString();
-
-            this.notifyListeners('syncCompleted', {
-                formResults,
-                mediaResults,
-                timestamp: this.lastSyncTime
-            });
+            // Mark as completed
+            await SyncQueueDAO.updateStatus(item.id, 'completed');
+            return { status: 'completed', result };
         } catch (error) {
-            console.error('Sync failed:', error);
-            this.notifyListeners('syncFailed', { error: error.message });
-        } finally {
-            this.isSyncing = false;
+            console.error(`Error processing sync item ${item.id}:`, error);
 
-            // If another sync was requested while we were syncing, schedule it
-            if (this.pendingSync) {
-                this.scheduleSync();
-            }
+            // Calculate next retry time with exponential backoff
+            const attempts = item.attempts + 1;
+            const backoffTime = Math.min(1000 * Math.pow(2, attempts), 30 * 60 * 1000); // Max 30 min
+            const nextRetry = new Date(Date.now() + backoffTime).toISOString();
+
+            await SyncQueueDAO.updateStatus(
+                item.id,
+                'error',
+                error.message,
+                attempts,
+                nextRetry
+            );
+
+            throw error;
         }
     }
 
@@ -298,5 +300,5 @@ class SyncService {
 }
 
 // Create and export a singleton instance
-const syncService = new SyncService();
-export default syncService;
+const syncManager = new SyncService();
+export default syncManager;
